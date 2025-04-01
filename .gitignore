@@ -7,6 +7,10 @@ Cargo.lock
 # Если Cargo.lock требуется в зависимости от типа проекта — удали эту строку
 /.cargo/config.toml
 
+# Игнорируем папки с моделями и AI
+/voice_server/models/
+/voice_server/AI/
+
 # IDE
 .idea/
 *.iml
