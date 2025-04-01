@@ -1,0 +1,87 @@
+# === Rust ===
+**/target/
+storage/*
+!storage/.gitkeep
+/**/*.rs.bk
+Cargo.lock
+# Если Cargo.lock требуется в зависимости от типа проекта — удали эту строку
+/.cargo/config.toml
+
+# IDE
+.idea/
+*.iml
+
+# Logs
+*.log
+
+# Backup
+*~
+*.swp
+*.swo
+
+# Rust analysis
+/.rustup/
+/rustup/
+/rls/
+/.rls/
+/.clippy/
+/.fuzz_target/
+/.cargo/
+
+# === Android Studio / Kotlin ===
+/.gradle
+/.gradle
+/build/
+/app/build/
+/captures/
+/.externalNativeBuild/
+/local.properties
+*.keystore
+*.jks
+
+# IntelliJ
+*.iws
+*.ipr
+*.iml
+.idea/
+
+# Kotlin/Java
+*.class
+*.jar
+*.war
+*.ear
+*.apk
+*.ap_
+
+# Build output
+*.dex
+*.log
+*.zip
+*.tar.gz
+
+# Android studio configurations
+/.idea/
+/*.iml
+.gradle/
+/build/
+
+# NDK / CMake cache
+.cxx/
+*.cmake
+CMakeFiles/
+cmake-build-*/
+
+# Other
+.DS_Store
+Thumbs.db
+
+# Tests / coverage
+/test-output/
+coverage/
+*.ec
+*.exec
+*.hprof
+
+# Misc
+*.orig
+*.rej
