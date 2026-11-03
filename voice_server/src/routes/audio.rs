@@ -1,72 +1,105 @@
-use axum::{extract::Multipart, response::Json, http::StatusCode};
-use serde::Serialize;
-use std::{fs, fs::File, io::Write, path::Path, sync::Arc};
-use uuid::Uuid;
-use vosk::Model;
-use crate::services::deepseek;
+//! POST /api/audio — основной эндпоинт MVP:
+//! WAV от клиента → VOSK STT → LLM (Ollama) → типизированный JSON-ответ.
 
-#[derive(Serialize)]
-pub struct ApiResponse {
-    r#type: String,
-    text: String,
-}
+use crate::model::response::ApiResponse;
+use crate::services::llm::LlmClient;
+use crate::utils::file;
+use axum::{extract::Multipart, response::Json, http::StatusCode};
+use std::{path::Path, sync::Arc};
+use crate::stt_engine::SttEngine;
+
+const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024; // ~5 минут 16 кГц mono 16-bit
 
 pub async fn handle_audio(
     mut multipart: Multipart,
-    model: Arc<Model>,
-) -> Result<Json<ApiResponse>, StatusCode> {
-    // Создаём папку storage, если её нет
-    let storage_path = Path::new("./storage");
-    if !storage_path.exists() {
-        if let Err(e) = fs::create_dir_all(storage_path) {
-            eprintln!("❌ Ошибка создания папки storage: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-        println!("📂 Папка storage создана!");
-    }
+    stt: Arc<dyn SttEngine>,
+    llm: Arc<LlmClient>,
+) -> Result<(StatusCode, Json<ApiResponse>), StatusCode> {
+    let storage = Path::new("./storage");
 
     while let Some(field) = multipart.next_field().await.unwrap_or(None) {
         let file_name = field.file_name().unwrap_or("input.wav").to_string();
-        let data = field.bytes().await.unwrap();
-
-        let id = Uuid::new_v4().to_string();
-        let file_path = format!("./storage/{}_{}", id, file_name);
-
-        if let Ok(mut file) = File::create(&file_path) {
-            if file.write_all(&data).is_err() {
-                eprintln!("❌ Ошибка записи файла: {}", file_path);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        let data = match field.bytes().await {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("❌ Не удалось прочитать поле multipart: {e}");
+                return Err(StatusCode::BAD_REQUEST);
             }
-            println!("💾 Файл сохранён: {}", file_path);
-        } else {
-            eprintln!("❌ Не удалось создать файл: {}", file_path);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+
+        if data.len() > MAX_UPLOAD_BYTES {
+            eprintln!("❌ Слишком большой файл: {} байт", data.len());
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        if data.is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
         }
 
-        match crate::services::stt::transcribe_audio(&model, &file_path) {
-            Ok(text) => {
-                println!("🧠 Распознано: {}", text);
-                // Отправляем в DeepSeek
-                match deepseek::send_to_deepseek(&text).await {
-                    Ok(ai_response) => {
-                        println!("🤖 DeepSeek ответил: {}", ai_response);
-                        return Ok(Json(ApiResponse {
-                            r#type: "text".into(),
-                            text: ai_response,
-                        }));
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️ Ошибка запроса к DeepSeek: {}", e);
-                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                    }
-                }
+        let file_path = match file::save_to_storage(storage, &file_name, &data) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("❌ Ошибка сохранения файла: {e}");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        println!("💾 Файл сохранён: {file_path}");
+
+        // STT — блокирующая нативная операция, выносим в blocking-пул
+        let stt_clone = stt.clone();
+        let path_for_stt = file_path.clone();
+        let transcript = tokio::task::spawn_blocking(move || {
+            stt_clone.transcribe_wav(&path_for_stt)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let transcript = match transcript {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("⚠️ Ошибка распознавания ({file_path}): {e}");
+                return Ok((
+                    StatusCode::OK,
+                    Json(ApiResponse::error("Не удалось распознать речь. Попробуйте ещё раз.")),
+                ));
+            }
+        };
+
+        if transcript.trim().is_empty() {
+            return Ok((
+                StatusCode::OK,
+                Json(ApiResponse::error(
+                    "Я вас не услышала — тишина в записи.",
+                )),
+            ));
+        }
+
+        println!("🧠 Распознано: {transcript}");
+
+        // Быстрые локальные команды (приветствие/помощь/стоп) не гоняем в LLM —
+        // отвечаем сразу, это экономит секунды на слабом железе.
+        let intent = crate::services::parser::parse_intent(&transcript);
+        if let Some(local) = crate::services::parser::reply(&intent) {
+            println!("⚡ Локальный интент: {intent:?}");
+            return Ok((StatusCode::OK, Json(ApiResponse::text(local, transcript))));
+        }
+
+        match llm.generate(&transcript).await {
+            Ok(answer) => {
+                println!("🤖 Ответ: {answer}");
+                return Ok((StatusCode::OK, Json(ApiResponse::text(answer, transcript))));
             }
             Err(e) => {
-                eprintln!("⚠️ Ошибка распознавания: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                eprintln!("⚠️ Ошибка LLM: {e}");
+                return Ok((
+                    StatusCode::OK,
+                    Json(ApiResponse::error(format!(
+                        "Модель недоступна: {e}"
+                    ))),
+                ));
             }
         }
     }
 
+    // Ни одного файла в запросе
     Err(StatusCode::BAD_REQUEST)
 }

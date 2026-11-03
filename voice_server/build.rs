@@ -1,45 +1,35 @@
-use std::{env, path::Path};
-use fs_extra::dir::{copy, CopyOptions};
+//! Линковка нативной библиотеки Vosk.
+//! Пути настраиваются переменными окружения, чтобы сборка работала
+//! и на Linux/macOS (Docker), и на Windows:
+//!   VOSK_LIB_DIR  — папка с libvosk.so/.dll/.dylib (по умолчанию ./vosk)
+//!   VOSK_STATIC   — "true", если линкуем .lib вместо динамики
+
+use std::env;
+use std::path::PathBuf;
 
 fn main() {
-    // Линковка Vosk
-    println!("cargo:rustc-link-search=native=vosk");
-    println!("cargo:rustc-link-lib=static=libvosk");
+    println!("cargo:rerun-if-env-changed=VOSK_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=VOSK_STATIC");
+    println!("cargo:rerun-if-changed=build.rs");
 
-    // Копирование папки AI только при локальной сборке
-    if env::var("DOCKER_BUILD").is_err() {
-        copy_ai_folder().unwrap_or_else(|e| {
-            println!("cargo:warning=Не удалось скопировать папку AI: {}", e);
-        });
-    }
-}
-
-fn copy_ai_folder() -> Result<(), Box<dyn std::error::Error>> {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR")?;
-    let profile = env::var("PROFILE")?;
-    let target_dir = env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
-    
-    let source = Path::new(&manifest_dir).join("AI");
-    let dest = Path::new(&target_dir).join(&profile).join("AI");
-
-    if !source.exists() {
-        return Err(format!("Папка AI не найдена по пути: {:?}", source).into());
+    // Нативная линковка нужна только если включена feature vosk-stt
+    if env::var("CARGO_FEATURE_VOSK_STT").is_err() {
+        return;
     }
 
-    let options = CopyOptions {
-        copy_inside: true,
-        overwrite: true,
-        ..Default::default()
-    };
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let lib_dir = env::var("VOSK_LIB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| manifest_dir.join("vosk"));
 
-    // Удаляем старую папку, если существует
-    if dest.exists() {
-        fs_extra::remove_items(&[&dest])?;
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let use_static = env::var("VOSK_STATIC").map(|v| v == "true").unwrap_or(false);
+
+    if use_static && target_os == "windows" {
+        println!("cargo:rustc-link-lib=static=libvosk");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=vosk");
     }
-
-    // Копируем папку
-    copy(&source, &dest, &options)?;
-    println!("cargo:warning=Папка AI скопирована в: {:?}", dest);
-    
-    Ok(())
 }

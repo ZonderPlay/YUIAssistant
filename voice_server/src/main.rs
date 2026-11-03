@@ -1,79 +1,111 @@
+//! voice_server — MVP голосового ассистента.
+//! Цепочка: WAV (multipart POST) → VOSK STT → Ollama LLM → JSON-ответ.
+
+mod config;
+mod stt_engine;
+mod model;
 mod routes;
 mod services;
-use axum::{routing::post, Router, extract::Multipart};
-use routes::audio::handle_audio;
-use std::{net::SocketAddr, sync::Arc, process::Command, thread, time::Duration};
-use tokio;
-use vosk::Model;
-use reqwest::Client;
-use serde_json::json;
+mod utils;
 
-/// Проверяет, запущен ли Ollama
-async fn is_ollama_running() -> bool {
-    let client = Client::new();
-    let url = "http://localhost:11434/api/generate";
+use crate::config::Config;
+use crate::services::llm::LlmClient;
+use axum::{
+    extract::Multipart,
+    http::{header, Method},
+    routing::{get, post},
+    Json, Router,
+};
+use std::{process::Command, sync::Arc, time::Duration};
+use tokio::net::TcpListener;
 
-    let body = json!({
-        "model": "deepseek-r1:1.5b",
-        "prompt": "Привет!",
-        "stream": false
-    });
-
-    client.post(url).json(&body).send().await.is_ok()
-}
-
-/// Запускает Ollama, если он не работает
-fn start_ollama() {
-    if !std::path::Path::new("AI/").exists() {
-        panic!("❌ Ошибка: Папка AI/ollama не найдена!");
+/// Запускает локальный ollama, если внешняя проверка не прошла.
+fn start_ollama(cfg: &Config) {
+    println!("🚀 Запуск Ollama ({})...", cfg.ollama_bin);
+    match Command::new(&cfg.ollama_bin).arg("serve").spawn() {
+        Ok(mut child) => {
+            // Убиваем дочерний процесс вместе с сервером
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => eprintln!("⚠️ Не удалось запустить Ollama автоматически: {e}"),
     }
-
-    println!("🚀 Запуск Ollama...");
-    let mut cmd = Command::new("AI/ollama")
-        .arg("serve")
-        .spawn()
-        .expect("❌ Ошибка запуска Ollama!");
-
-    thread::sleep(Duration::from_secs(2)); // Ждём пару секунд для запуска
-    println!("✅ Ollama запущен!");
-
-    // Опционально: убить процесс при завершении
-    std::thread::spawn(move || {
-        cmd.wait().expect("❌ Ollama неожиданно завершился!");
-    });
 }
 
 #[tokio::main]
 async fn main() {
-    println!("⏳ Проверка Ollama...");
+    let cfg = Config::default();
 
-    if !is_ollama_running().await {
-        start_ollama();
-        tokio::time::sleep(Duration::from_secs(5)).await; // Подождём запуск
-    } else {
+    let llm = Arc::new(LlmClient::new(&cfg));
+
+    println!("⏳ Проверка Ollama ({})...", cfg.ollama_url);
+    if llm.is_available().await {
         println!("✅ Ollama уже работает!");
-    }
-
-    println!("⏳ Загрузка модели VOSK...");
-    let model = Arc::new(Model::new("models").expect("❌ Ошибка инициализации модели VOSK"));
-    println!("✅ Модель VOSK загружена успешно!");
-
-    // Используем async move в качестве обработчика маршрута
-    let app = Router::new().route("/api/audio", post({
-        let model = model.clone();
-        move |multipart: Multipart| {
-            let model = model.clone();
-            async move {
-                handle_audio(multipart, model).await
+    } else {
+        if cfg.autostart_ollama {
+            start_ollama(&cfg);
+            // ждём готовности до 30 секунд
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if llm.is_available().await {
+                    break;
+                }
             }
         }
-    }));
+        if llm.is_available().await {
+            println!("✅ Ollama запущен!");
+        } else {
+            eprintln!(
+                "⚠️ Ollama недоступен по {}. Сервер стартует без LLM — \
+                 ответы будут ошибочными, пока не поднимете `ollama serve`.",
+                cfg.ollama_url
+            );
+        }
+    }
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    println!("🚀 Сервер запущен: http://{}", addr);
+    println!("⏳ Инициализация STT-движка (модель: {})...", cfg.vosk_model_dir);
+    let stt: Arc<dyn stt_engine::SttEngine> =
+        Arc::from(stt_engine::create_engine(&cfg.vosk_model_dir).expect("❌ Ошибка инициализации STT"));
+    println!("✅ STT-движок готов!");
 
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    // CORS — чтобы тестовать с веб-клиента/эмулятора
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(vec![Method::GET, Method::POST])
+        .allow_headers(vec![header::CONTENT_TYPE]);
+
+    let app = Router::new()
+        .route(
+            "/api/audio",
+            post({
+                let stt = stt.clone();
+                let llm = llm.clone();
+                move |mp: Multipart| {
+                    let stt = stt.clone();
+                    let llm = llm.clone();
+                    async move { routes::audio::handle_audio(mp, stt, llm).await }
+                }
+            }),
+        )
+        .route("/health", get(health))
+        .layer(cors);
+
+    let addr = cfg.bind_addr.clone();
+    println!("🚀 Сервер запущен: http://{addr}");
+
+    // Фоновая чистка storage от старых записей (раз в 10 минут хранится сутки)
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            utils::file::cleanup_old_files(std::path::Path::new("./storage"), 86_400);
+        }
+    });
+
+    let listener = TcpListener::bind(&addr).await.expect("не удалось занять порт");
+    axum::serve(listener, app).await.expect("ошибка сервера");
+}
+
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
 }
