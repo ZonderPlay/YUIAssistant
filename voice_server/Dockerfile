@@ -27,11 +27,11 @@ RUN mkdir -p /app/models && \
 # Финальный образ: Debian + Ollama поверх
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl zstd && \
     rm -rf /var/lib/apt/lists/*
 
 # Ollama (официальный установщик, актуальная версия вместо древней v0.1.25)
-RUN curl -fsSL https://ollama.com/install.sh | sh
+RUN OLLAMA_NO_START=1 curl -fsSL https://ollama.com/install.sh | sh
 
 WORKDIR /app
 COPY --from=builder /app/target/release/voice_server /usr/local/bin/voice_server
