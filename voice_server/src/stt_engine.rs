@@ -25,7 +25,15 @@ pub mod vosk_engine {
 
     impl VoskEngine {
         pub fn load(model_dir: &str) -> Result<Self, SttError> {
-            let model = Model::new(model_dir)?;
+            // vosk 0.3.x: Model::new возвращает Option (None — модель не найдена/повреждена),
+            // поэтому `?` напрямую неприменим — конвертируем в осмысленную ошибку.
+            let model = Model::new(model_dir).ok_or_else(|| {
+                format!(
+                    "Не удалось загрузить VOSK-модель из '{model_dir}'. \
+                     Проверьте, что папка существует и содержит файлы модели \
+                     (например, vosk-model-small-ru)."
+                )
+            })?;
             Ok(Self { model: Arc::new(model) })
         }
     }

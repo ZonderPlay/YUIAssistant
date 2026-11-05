@@ -1,0 +1,5 @@
+cargo:rerun-if-env-changed=VOSK_LIB_DIR
+cargo:rerun-if-env-changed=VOSK_STATIC
+cargo:rerun-if-changed=build.rs
+cargo:rustc-link-search=native=/workspace/voice_server/vosklib
+cargo:rustc-link-lib=dylib=vosk
